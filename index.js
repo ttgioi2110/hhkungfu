@@ -8,12 +8,12 @@ const PORT = process.env.PORT || 7000;
 const headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Referer": BASE_URL,
-    "X-Requested-With": "XMLHttpRequest"
+    "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"
 };
 
 const manifest = {
     id: "org.hhkungfu.donghua",
-    version: "1.0.0",
+    version: "1.0.1",
     name: "HHKungFu Donghua",
     description: "Xem phim Hoạt Hình Trung Quốc 3D trực tiếp từ HHKungFu",
     resources: ["catalog", "meta", "stream"],
@@ -31,8 +31,8 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
-// --- CATALOG HANDLER ---
-builder.defineCatalogHandler(async ({ type, id, extra }) => {
+// 1. CATALOG HANDLER
+builder.defineCatalogHandler(async ({ type, extra }) => {
     if (type !== "series") return { metas: [] };
 
     let url = BASE_URL;
@@ -41,7 +41,7 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
     }
 
     try {
-        const { data } = await axios.get(url, { headers, timeout: 8000 });
+        const { data } = await axios.get(url, { headers, timeout: 10000 });
         const $ = cheerio.load(data);
         const metas = [];
 
@@ -71,13 +71,13 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
     }
 });
 
-// --- META HANDLER ---
-builder.defineMetaHandler(async ({ type, id }) => {
+// 2. META HANDLER
+builder.defineMetaHandler(async ({ id }) => {
     const slug = id.replace("hhkf_", "");
     const filmUrl = `${BASE_URL}/${slug}/`;
 
     try {
-        const { data } = await axios.get(filmUrl, { headers, timeout: 8000 });
+        const { data } = await axios.get(filmUrl, { headers, timeout: 10000 });
         const $ = cheerio.load(data);
 
         const title = $(".entry-title, h1.title").first().text().trim() || slug;
@@ -85,7 +85,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
         const description = $(".entry-content p, .film-content").text().trim();
 
         const videos = [];
-        const episodeElements = $("#halim-list-server li a, .list-episodes a");
+        const episodeElements = $("#halim-list-server li a, .list-episodes a, .halim-episode a");
 
         if (episodeElements.length > 0) {
             episodeElements.each((i, el) => {
@@ -93,20 +93,14 @@ builder.defineMetaHandler(async ({ type, id }) => {
                 const epHref = $(el).attr("href") || "";
                 const episodeNum = i + 1;
 
-                videos.push({
-                    id: `hhkf_${slug}_ep_${episodeNum}_${Buffer.from(epHref).toString("base64url")}`,
-                    title: epTitle || `Tập ${episodeNum}`,
-                    season: 1,
-                    episode: episodeNum
-                });
-            });
-        } else {
-            // Mặc định 1 tập nếu không phân tập
-            videos.push({
-                id: `hhkf_${slug}_ep_1_${Buffer.from(filmUrl).toString("base64url")}`,
-                title: "Tập 1",
-                season: 1,
-                episode: 1
+                if (epHref) {
+                    videos.push({
+                        id: `hhkf_${slug}_ep_${episodeNum}_${Buffer.from(epHref).toString("base64url")}`,
+                        title: epTitle || `Tập ${episodeNum}`,
+                        season: 1,
+                        episode: episodeNum
+                    });
+                }
             });
         }
 
@@ -126,36 +120,46 @@ builder.defineMetaHandler(async ({ type, id }) => {
     }
 });
 
-// --- STREAM HANDLER ---
-builder.defineStreamHandler(async ({ type, id }) => {
+// 3. STREAM HANDLER
+builder.defineStreamHandler(async ({ id }) => {
     try {
         const parts = id.split("_");
         const encodedUrl = parts[parts.length - 1];
-        const targetUrl = Buffer.from(encodedUrl, "base64url").toString("utf-8");
+        let targetUrl = Buffer.from(encodedUrl, "base64url").toString("utf-8");
 
-        const { data } = await axios.get(targetUrl, { headers, timeout: 8000 });
+        if (!targetUrl.startsWith("http")) {
+            targetUrl = `${BASE_URL}${targetUrl.startsWith('/') ? '' : '/'}${targetUrl}`;
+        }
+
+        const { data } = await axios.get(targetUrl, { headers, timeout: 10000 });
         const $ = cheerio.load(data);
 
-        // Bóc tách nguồn video từ iframe phát lại
-        let iframeSrc = $("iframe").attr("src") || $("#player-embed iframe").attr("src");
+        let streamUrl = "";
+
+        // Kiểm tra player nhúng iframe
+        let iframeSrc = $("#player-embed iframe, .player-embed iframe, iframe").first().attr("src");
 
         if (!iframeSrc) {
-            // Trường hợp trang dùng AJAX HalimPlayer
-            const episodeId = $(".halim-btn-active").attr("data-post-id");
-            const serverId = $(".halim-btn-active").attr("data-server");
+            // Gửi request AJAX lấy link player nếu dùng HalimPlayer
+            const episodeId = $(".halim-btn-active").attr("data-post-id") || $("#player-embed").attr("data-post-id");
+            const serverId = $(".halim-btn-active").attr("data-server") || "1";
             const episodeSlug = $(".halim-btn-active").attr("data-episode");
 
             if (episodeId) {
-                const ajaxRes = await axios.post(
-                    `${BASE_URL}/wp-admin/admin-ajax.php`,
-                    new URLSearchParams({
-                        action: "halim_ajax_player",
-                        episode: episodeSlug,
-                        postid: episodeId,
-                        server: serverId
-                    }),
-                    { headers }
-                );
+                const params = new URLSearchParams();
+                params.append("action", "halim_ajax_player");
+                params.append("episode", episodeSlug || "");
+                params.append("postid", episodeId);
+                params.append("server", serverId);
+
+                const ajaxRes = await axios.post(`${BASE_URL}/wp-admin/admin-ajax.php`, params, {
+                    headers: {
+                        ...headers,
+                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                        "X-Requested-With": "XMLHttpRequest"
+                    }
+                });
+
                 if (ajaxRes.data && ajaxRes.data.data) {
                     const embed$ = cheerio.load(ajaxRes.data.data);
                     iframeSrc = embed$("iframe").attr("src");
@@ -165,13 +169,25 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
         if (iframeSrc) {
             if (iframeSrc.startsWith("//")) iframeSrc = "https:" + iframeSrc;
+            streamUrl = iframeSrc;
+        }
 
+        if (streamUrl) {
             return {
                 streams: [
                     {
-                        title: "HHKungFu Web Embed",
-                        type: "embed",
-                        url: iframeSrc
+                        name: "HHKungFu",
+                        title: "Server VIP - Web Player",
+                        url: streamUrl,
+                        behaviorHints: {
+                            notSupportedInBrowser: false,
+                            proxyHeaders: {
+                                request: {
+                                    "User-Agent": headers["User-Agent"],
+                                    "Referer": BASE_URL
+                                }
+                            }
+                        }
                     }
                 ]
             };
@@ -185,4 +201,3 @@ builder.defineStreamHandler(async ({ type, id }) => {
 });
 
 serveHTTP(builder.getInterface(), { port: PORT });
-console.log(`Server Addon đang chạy tại cổng: ${PORT}`);
