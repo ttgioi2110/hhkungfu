@@ -14,9 +14,9 @@ const headers = {
 
 const manifest = {
     id: "org.hhkungfu.donghua",
-    version: "1.0.2",
+    version: "1.0.3",
     name: "HHKungFu Donghua",
-    description: "Xem phim Hoạt Hình Trung Quốc 3D trực tiếp từ HHKungFu",
+    description: "Xem phim Hoạt Hình Trung Quốc 3D trực tiếp trong Stremio",
     resources: ["catalog", "meta", "stream"],
     types: ["series"],
     catalogs: [
@@ -31,6 +31,65 @@ const manifest = {
 };
 
 const builder = new addonBuilder(manifest);
+
+// Hàm bóc tách link video trực tiếp (.m3u8 hoặc .mp4) từ player iframe
+async function extractDirectVideoUrl(iframeSrc) {
+    if (!iframeSrc) return null;
+    if (iframeSrc.startsWith("//")) iframeSrc = "https:" + iframeSrc;
+
+    if (iframeSrc.includes(".m3u8") || iframeSrc.includes(".mp4")) {
+        return iframeSrc;
+    }
+
+    try {
+        const res = await axios.get(iframeSrc, {
+            headers: {
+                "User-Agent": headers["User-Agent"],
+                "Referer": BASE_URL
+            },
+            timeout: 5000
+        });
+
+        const html = res.data;
+
+        // Tìm URL m3u8 hoặc mp4 dạng trực tiếp trong HTML/JS
+        const m3u8Match = html.match(/(https?:\/\/[^"'\s]+\.m3u8[^"'\s]*)/i) || 
+                          html.match(/(https?:\/\/[^"'\s]+\.mp4[^"'\s]*)/i);
+        if (m3u8Match) {
+            return m3u8Match[1];
+        }
+
+        // Tìm file nguồn player
+        const fileMatch = html.match(/file\s*:\s*["']([^"']+)["']/i) || 
+                          html.match(/src\s*:\s*["']([^"']+)["']/i);
+        if (fileMatch && (fileMatch[1].startsWith("http") || fileMatch[1].startsWith("/"))) {
+            let mediaUrl = fileMatch[1];
+            if (mediaUrl.startsWith("/")) {
+                const origin = new URL(iframeSrc).origin;
+                mediaUrl = origin + mediaUrl;
+            }
+            return mediaUrl;
+        }
+
+        // Bóc mã Base64 chứa link m3u8 nếu có
+        const b64Matches = html.match(/[A-Za-z0-9+/=]{30,}/g);
+        if (b64Matches) {
+            for (const b64 of b64Matches) {
+                try {
+                    const decoded = Buffer.from(b64, 'base64').toString('utf-8');
+                    if (decoded.includes('.m3u8') || decoded.includes('.mp4')) {
+                        const match = decoded.match(/(https?:\/\/[^"'\s]+\.(?:m3u8|mp4)[^"'\s]*)/i);
+                        if (match) return match[1];
+                    }
+                } catch (e) {}
+            }
+        }
+    } catch (e) {
+        console.error("Lỗi giải mã iframe:", e.message);
+    }
+
+    return iframeSrc;
+}
 
 // 1. CATALOG HANDLER
 builder.defineCatalogHandler(async ({ type, extra }) => {
@@ -148,59 +207,56 @@ builder.defineStreamHandler(async ({ id }) => {
             targetUrl = `${BASE_URL}${targetUrl.startsWith("/") ? "" : "/"}${targetUrl}`;
         }
 
-        // Luồng 1: Mở trực tiếp trang tập phim trên Web (Đảm bảo luôn xuất hiện nút bấm trong Stremio)
-        streams.push({
-            name: "HHKungFu Web",
-            title: "🌐 Mở Trình Duyệt Xem Tập Này",
-            externalUrl: targetUrl
-        });
+        const { data } = await axios.get(targetUrl, { headers, timeout: 8000 });
+        const $ = cheerio.load(data);
 
-        // Bóc tách luồng Embed từ Server
-        try {
-            const { data } = await axios.get(targetUrl, { headers, timeout: 8000 });
-            const $ = cheerio.load(data);
+        let iframeSrc = $("#player-embed iframe, .player-embed iframe, .halim-player-box iframe, iframe").first().attr("src");
 
-            let iframeSrc = $("#player-embed iframe, .player-embed iframe, .halim-player-box iframe, iframe").first().attr("src");
+        if (!iframeSrc) {
+            const episodeId = $(".halim-btn-active").attr("data-post-id") || $("#player-embed").attr("data-post-id");
+            const serverId = $(".halim-btn-active").attr("data-server") || "1";
+            const episodeSlug = $(".halim-btn-active").attr("data-episode");
 
-            if (!iframeSrc) {
-                const episodeId = $(".halim-btn-active").attr("data-post-id") || $("#player-embed").attr("data-post-id");
-                const serverId = $(".halim-btn-active").attr("data-server") || "1";
-                const episodeSlug = $(".halim-btn-active").attr("data-episode");
+            if (episodeId) {
+                const params = new URLSearchParams();
+                params.append("action", "halim_ajax_player");
+                params.append("episode", episodeSlug || "");
+                params.append("postid", episodeId);
+                params.append("server", serverId);
 
-                if (episodeId) {
-                    const params = new URLSearchParams();
-                    params.append("action", "halim_ajax_player");
-                    params.append("episode", episodeSlug || "");
-                    params.append("postid", episodeId);
-                    params.append("server", serverId);
+                const ajaxRes = await axios.post(`${BASE_URL}/wp-admin/admin-ajax.php`, params, {
+                    headers: {
+                        ...headers,
+                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                        "X-Requested-With": "XMLHttpRequest"
+                    },
+                    timeout: 5000
+                });
 
-                    const ajaxRes = await axios.post(`${BASE_URL}/wp-admin/admin-ajax.php`, params, {
-                        headers: {
-                            ...headers,
-                            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                            "X-Requested-With": "XMLHttpRequest"
-                        },
-                        timeout: 5000
-                    });
-
-                    if (ajaxRes.data && ajaxRes.data.data) {
-                        const embed$ = cheerio.load(ajaxRes.data.data);
-                        iframeSrc = embed$("iframe").attr("src");
-                    }
+                if (ajaxRes.data && ajaxRes.data.data) {
+                    const embed$ = cheerio.load(ajaxRes.data.data);
+                    iframeSrc = embed$("iframe").attr("src");
                 }
             }
+        }
 
-            if (iframeSrc) {
-                if (iframeSrc.startsWith("//")) iframeSrc = "https:" + iframeSrc;
-                
-                streams.unshift({
-                    name: "HHKungFu Player",
-                    title: "▶️ Trình Phát Embed (External Player)",
-                    externalUrl: iframeSrc
-                });
-            }
-        } catch (fetchErr) {
-            console.error("Lỗi cào Player:", fetchErr.message);
+        if (iframeSrc) {
+            const videoUrl = await extractDirectVideoUrl(iframeSrc);
+
+            streams.push({
+                name: "HHKungFu Direct",
+                title: "▶️ Phát Trực Tiếp Trên Stremio",
+                url: videoUrl,
+                behaviorHints: {
+                    notSupportedInBrowser: false,
+                    proxyHeaders: {
+                        request: {
+                            "User-Agent": headers["User-Agent"],
+                            "Referer": BASE_URL
+                        }
+                    }
+                }
+            });
         }
 
         return { streams };
